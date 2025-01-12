@@ -31,6 +31,7 @@ from typing import Any, Dict, Optional, Union, Iterable
 import tensorflow as tf
 
 
+@tf.keras.utils.register_keras_serializable(package="DeepConsensus")
 class Attention(tf.keras.layers.Layer):
   """Multi-headed attention layer."""
 
@@ -40,41 +41,45 @@ class Attention(tf.keras.layers.Layer):
       num_heads: int,
       attention_dropout: float,
       attn_win_size: Optional[int] = None,
+      **kwargs
   ):
     """Initialize Attention.
 
     Args:
       hidden_size: int, output dim of hidden layer.
-      num_heads: int, number of heads to repeat the same attention structure.
+      num_heads: int, number of heads for attention.
       attention_dropout: float, dropout rate inside attention for training.
-      attn_win_size: Optional[int], local sliding window attention length. Use
-        None for full attention.
+      attn_win_size: Optional[int], local sliding window attention length.
+                     None = full attention.
+      **kwargs: additional keyword arguments passed to tf.keras.layers.Layer.
     """
+    super().__init__(**kwargs)
     if hidden_size % num_heads:
       raise ValueError(
-          "Hidden size ({}) must be divisible by the number of heads ({})."
-          .format(hidden_size, num_heads)
+          f"Hidden size ({hidden_size}) must be divisible by the number of "
+          f"heads ({num_heads})."
       )
-
-    super(Attention, self).__init__()
     self.hidden_size = hidden_size
     self.num_heads = num_heads
     self.attention_dropout = attention_dropout
     self.attn_win_size = attn_win_size
 
   def build(self, input_shape: Union[tf.TensorShape, Iterable[tf.TensorShape]]):
-    """Builds the layer."""
-    # Layers for linearly projecting the queries, keys, and values.
+    """Builds the layer (creates trainable weights)."""
     size_per_head = self.hidden_size // self.num_heads
 
     def _glorot_initializer(fan_in, fan_out):
       limit = math.sqrt(6.0 / (fan_in + fan_out))
       return tf.keras.initializers.RandomUniform(minval=-limit, maxval=limit)
 
-    input_hidden_size = input_shape.as_list()[-1]
+    # input_shape is [batch_size, input_length, hidden_size].
+    input_hidden_size = input_shape[-1]
+
     query_initializer = _glorot_initializer(input_hidden_size, self.hidden_size)
     key_initializer = _glorot_initializer(input_hidden_size, self.hidden_size)
     value_initializer = _glorot_initializer(input_hidden_size, self.hidden_size)
+    
+    # Project Q, K, V
     self.query_dense_layer = tf.keras.layers.experimental.EinsumDense(
         "BTE,ENH->BTNH",
         output_shape=(None, self.num_heads, size_per_head),
@@ -97,6 +102,7 @@ class Attention(tf.keras.layers.Layer):
         name="value",
     )
 
+    # Final projection
     output_initializer = _glorot_initializer(self.hidden_size, self.hidden_size)
     self.output_dense_layer = tf.keras.layers.experimental.EinsumDense(
         "BTNH,NHE->BTE",
@@ -106,28 +112,16 @@ class Attention(tf.keras.layers.Layer):
         name="output_transform",
     )
 
-    # input_shape = [batch_size, input_length, hidden_size]
-    max_length = input_shape.as_list()[1]
-
+    # Create attention mask
+    max_length = input_shape[1]
     if self.attn_win_size:
-      self.attn_mask = tf.ones([1, 1, max_length, max_length])
-      self.attn_mask = tf.linalg.band_part(
-          self.attn_mask, self.attn_win_size, self.attn_win_size
-      )
-      # attn_mask will contain True values in the band and False values outside.
-      self.attn_mask = self.attn_mask > 0.0
+      attn_mask = tf.ones([1, 1, max_length, max_length])
+      attn_mask = tf.linalg.band_part(attn_mask, self.attn_win_size, self.attn_win_size)
+      self.attn_mask = attn_mask > 0.0
     else:
       self.attn_mask = tf.ones([1, 1, max_length, max_length]) > 0.0
 
-    super(Attention, self).build(input_shape)
-
-  def get_config(self) -> Dict[str, Any]:
-    return {
-        "hidden_size": self.hidden_size,
-        "num_heads": self.num_heads,
-        "attention_dropout": self.attention_dropout,
-        "attn_win_size": self.attn_win_size,
-    }
+    super().build(input_shape)
 
   def call(
       self,
@@ -138,54 +132,31 @@ class Attention(tf.keras.layers.Layer):
       cache: Optional[Dict[str, tf.Tensor]] = None,
       decode_loop_step: Optional[int] = None,
   ) -> Dict[str, tf.Tensor]:
-    """Apply attention mechanism to query_input and source_input.
-
-    Args:
-      query_input: A tensor with shape [batch_size, length_query, hidden_size].
-      source_input: A tensor with shape [batch_size, length_source,
-        hidden_size].
-      bias: A tensor with shape [batch_size, 1, length_query, length_source],
-        the attention bias that will be added to the result of the dot product.
-      training: A bool, whether in training mode or not.
-      cache: (Used during prediction) A dictionary with tensors containing
-        results of previous attentions. The dictionary must have the items:
-        {"k": tensor with shape [batch_size, i, heads, dim_per_head], "v":
-        tensor with shape [batch_size, i, heads, dim_per_head]} where i is the
-        current decoded length for non-padded decode, or max sequence length for
-        padded decode.
-      decode_loop_step: An integer, step number of the decoding loop. Used only
-        for autoregressive inference on TPU.
-
-    Returns:
-      Dictionary with the following (key:value) pairs:
-        "main_output": Attention layer output with shape [batch_size,
-        length_query, hidden_size]. Used as input to the feed_forward_network.
-        "attention scores": Attention map weights (after softmax) with shape
-        [batch_size, num_heads, length_query, length_query] - auxiliary output.
-    """
-    # Linearly project the query, key and value using different learned
-    # projections. Splitting heads is automatically done during the linear
-    # projections --> [batch_size, length, num_heads, dim_per_head].
+    """Apply attention mechanism to query_input and source_input."""
+    # Project Q, K, V
     query = self.query_dense_layer(query_input)
     key = self.key_dense_layer(source_input)
     value = self.value_dense_layer(source_input)
 
+    # Handle caching (for inference/prediction)
     if cache is not None:
-      # Combine cached keys and values with new keys and values.
       if decode_loop_step is not None:
-        cache_k_shape = cache["k"].shape.as_list()
+        # Step-by-step decode
+        cache_k_shape = cache["k"].shape
         indices = tf.reshape(
             tf.one_hot(decode_loop_step, cache_k_shape[1], dtype=key.dtype),
             [1, cache_k_shape[1], 1, 1],
         )
         key = cache["k"] + key * indices
-        cache_v_shape = cache["v"].shape.as_list()
+
+        cache_v_shape = cache["v"].shape
         indices = tf.reshape(
             tf.one_hot(decode_loop_step, cache_v_shape[1], dtype=value.dtype),
             [1, cache_v_shape[1], 1, 1],
         )
         value = cache["v"] + value * indices
       else:
+        # Append new K, V to existing
         key = tf.concat([tf.cast(cache["k"], key.dtype), key], axis=1)
         value = tf.concat([tf.cast(cache["v"], value.dtype), value], axis=1)
 
@@ -193,36 +164,53 @@ class Attention(tf.keras.layers.Layer):
       cache["k"] = key
       cache["v"] = value
 
-    # Scale query to prevent the dot product between query and key from growing
-    # too large.
+    # Scale query
     depth = self.hidden_size // self.num_heads
-    query *= depth**-0.5
+    query *= depth ** -0.5
 
-    # Calculate dot product attention
+    # Compute dot product attention: logits shape = [batch, num_heads, length_source, length_query]
+    # But we do an einsum that puts the "head" dimension differently:
     logits = tf.einsum("BTNH,BFNH->BNFT", key, query)
     logits += bias
-    # False values in the mask will be set to a large negative number in the
-    # logits. The attention scores for elements outside the band will be close
-    # to 0 after softmax.
+
+    # Mask out-of-window (or out-of-bounds) positions
     logits = tf.where(self.attn_mask, logits, -1e9)
-    # Note that softmax internally performs math operations using float32
-    # for numeric stability. When training with float16, we keep the input
-    # and output in float16 for better performance.
+
+    # Softmax over the "source" positions
     weights = tf.nn.softmax(logits, name="attention_weights")
     if training:
       weights = tf.nn.dropout(weights, rate=self.attention_dropout)
-    attention_output = tf.einsum("BNFT,BTNH->BFNH", weights, value)
 
-    # Run the outputs through another linear projection layer. Recombining heads
-    # is automatically done --> [batch_size, length, hidden_size]
+    # Weighted sum of values
+    attention_output = tf.einsum("BNFT,BTNH->BFNH", weights, value)
+    # Final projection
     attention_output = self.output_dense_layer(attention_output)
 
-    layer_output = dict(main_output=attention_output, attention_scores=weights)
-    return layer_output
+    return {
+        "main_output": attention_output,
+        "attention_scores": weights
+    }
+
+  def get_config(self) -> Dict[str, Any]:
+    """Return a JSON-serializable config."""
+    config = super().get_config()
+    config.update({
+        "hidden_size": self.hidden_size,
+        "num_heads": self.num_heads,
+        "attention_dropout": self.attention_dropout,
+        "attn_win_size": self.attn_win_size,
+    })
+    return config
+
+  @classmethod
+  def from_config(cls, config: Dict[str, Any]):
+    """Recreate layer from config."""
+    return cls(**config)
 
 
+@tf.keras.utils.register_keras_serializable(package="DeepConsensus")
 class SelfAttention(Attention):
-  """Multiheaded self-attention layer."""
+  """Multiheaded self-attention layer (Q=K=V=inputs)."""
 
   def call(
       self,
@@ -232,6 +220,13 @@ class SelfAttention(Attention):
       cache: Optional[Dict[str, tf.Tensor]] = None,
       decode_loop_step: Optional[int] = None,
   ) -> Dict[str, tf.Tensor]:
+    # Just pass query_input as source_input
     return super(SelfAttention, self).call(
-        query_input, query_input, bias, training, cache, decode_loop_step
+        query_input=query_input,
+        source_input=query_input,
+        bias=bias,
+        training=training,
+        cache=cache,
+        decode_loop_step=decode_loop_step,
     )
+  

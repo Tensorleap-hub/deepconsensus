@@ -31,23 +31,26 @@ from typing import Any, Dict, Union, Iterable
 import tensorflow as tf
 
 
+@tf.keras.utils.register_keras_serializable(package="DeepConsensus")
 class FeedForwardNetwork(tf.keras.layers.Layer):
   """Fully connected feedforward network."""
 
-  def __init__(self, hidden_size: int, filter_size: int, relu_dropout: float):
+  def __init__(self, hidden_size: int, filter_size: int, relu_dropout: float, **kwargs):
     """Initialize FeedForwardNetwork.
 
     Args:
       hidden_size: int, output dim of hidden layer.
       filter_size: int, filter size for the inner (first) dense layer.
       relu_dropout: float, dropout rate for training.
+      **kwargs: Additional keyword arguments passed to tf.keras.layers.Layer.
     """
-    super(FeedForwardNetwork, self).__init__()
+    super().__init__(**kwargs)
     self.hidden_size = hidden_size
     self.filter_size = filter_size
     self.relu_dropout = relu_dropout
 
   def build(self, input_shape: Union[tf.TensorShape, Iterable[tf.TensorShape]]):
+    """Creates weights (Dense layers) once input shapes are known."""
     self.filter_dense_layer = tf.keras.layers.Dense(
         self.filter_size,
         use_bias=True,
@@ -57,14 +60,22 @@ class FeedForwardNetwork(tf.keras.layers.Layer):
     self.output_dense_layer = tf.keras.layers.Dense(
         self.hidden_size, use_bias=True, name="output_layer"
     )
-    super(FeedForwardNetwork, self).build(input_shape)
+    super().build(input_shape)
 
   def get_config(self) -> Dict[str, Any]:
-    return {
+    """Returns a JSON-serializable config."""
+    config = super().get_config()  # This adds base layer config (e.g. name)
+    config.update({
         "hidden_size": self.hidden_size,
         "filter_size": self.filter_size,
         "relu_dropout": self.relu_dropout,
-    }
+    })
+    return config
+
+  @classmethod
+  def from_config(cls, config: Dict[str, Any]):
+    """Recreate this layer from its config."""
+    return cls(**config)
 
   def call(self, x: tf.Tensor, training: bool) -> Dict[str, tf.Tensor]:
     """Return outputs of the feedforward network.
@@ -74,14 +85,11 @@ class FeedForwardNetwork(tf.keras.layers.Layer):
       training: boolean, whether in training mode or not.
 
     Returns:
-      Dictionary with the following (key:value) pairs:
-        "main_output": Output of the feedforward network with shape [batch_size,
-        length, hidden_size]. Used as input to the next encoder layer.
+      A dictionary with key "main_output":
+        shape [batch_size, length, hidden_size]
     """
-    # Retrieve dynamically known shapes
-
     output = self.filter_dense_layer(x)
     if training:
       output = tf.nn.dropout(output, rate=self.relu_dropout)
     output = self.output_dense_layer(output)
-    return dict(main_output=output)
+    return {"main_output": output}

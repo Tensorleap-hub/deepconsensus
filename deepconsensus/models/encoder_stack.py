@@ -40,88 +40,125 @@ from deepconsensus.models import attention_layer
 from deepconsensus.models import ffn_layer
 
 
+@tf.keras.utils.register_keras_serializable(package="DeepConsensus")
 class PrePostProcessingWrapper(tf.keras.layers.Layer):
   """Wrapper class that applies layer pre-processing and post-processing."""
 
   def __init__(
-      self, layer: tf.keras.layers.Layer, params: ml_collections.ConfigDict
+      self, 
+      layer: tf.keras.layers.Layer, 
+      params: ml_collections.ConfigDict,
+      **kwargs
   ):
-    super(PrePostProcessingWrapper, self).__init__()
+    super().__init__(**kwargs)
     self.layer = layer
-    self.params = params
-    self.postprocess_dropout = params["layer_postprocess_dropout"]
+    # Convert ml_collections.ConfigDict -> plain dict if you need to store it
+    self.params = dict(params)
+    self.postprocess_dropout = self.params["layer_postprocess_dropout"]
+    self._use_rezero = self.params["rezero"]
+
+    # We won't create self.alpha or self.layer_norm here;
+    # Instead, we do that in build(), once input shapes are known.
 
   def build(self, input_shape: Union[tf.TensorShape, Iterable[tf.TensorShape]]):
-    if self.params["rezero"]:
-      # Variable used in ReZero (paper: https://arxiv.org/abs/2003.04887).
+    if self._use_rezero:
+      # ReZero variable
       alpha_init = tf.zeros_initializer()
       self.alpha = tf.Variable(
-          initial_value=alpha_init(shape=()), trainable=True
+          initial_value=alpha_init(shape=()), 
+          trainable=True, 
+          name="rezero_alpha"
       )
     else:
       self.layer_norm = tf.keras.layers.LayerNormalization(
-          epsilon=1e-6, dtype="float32"
+          epsilon=1e-6, 
+          dtype="float32",
+          name="layer_norm"
       )
-    super(PrePostProcessingWrapper, self).build(input_shape)
-
-  def get_config(self) -> Dict[str, Any]:
-    return {
-        "params": self.params,
-    }
+    super().build(input_shape)
 
   def call(self, x: tf.Tensor, *args, **kwargs) -> Dict[str, tf.Tensor]:
     """Calls wrapped layer with same parameters."""
-    training = kwargs["training"]
+    training = kwargs.get("training", False)
 
-    if self.params["rezero"]:
+    if self._use_rezero:
       y = x
     else:
       y = self.layer_norm(x)
 
-    # Get layer output.
+    # Get layer output (expects it to return a dict with "main_output")
     layer_output = self.layer(y, *args, **kwargs)
-    y = layer_output["main_output"]
+    main_out = layer_output["main_output"]
 
-    # Postprocessing: apply dropout and residual connection
+    # Postprocessing: dropout + residual connection
     if training:
-      y = tf.nn.dropout(y, rate=self.postprocess_dropout)
-    if self.params["rezero"]:
-      # Apply ReZero.
-      layer_output["main_output"] = x + self.alpha * y
+      main_out = tf.nn.dropout(main_out, rate=self.postprocess_dropout)
+    if self._use_rezero:
+      layer_output["main_output"] = x + self.alpha * main_out
     else:
-      layer_output["main_output"] = x + y
+      layer_output["main_output"] = x + main_out
+
     return layer_output
 
+  def get_config(self) -> Dict[str, Any]:
+    """Returns a JSON-serializable config."""
+    config = super().get_config()
+    # We must ensure only standard JSON-serializable data goes in here
+    config.update({
+        "params": self.params,
+        "layer": tf.keras.utils.serialize_keras_object(self.layer),
+    })
+    return config
 
+  @classmethod
+  def from_config(cls, config: Dict[str, Any]):
+    """Recreate PrePostProcessingWrapper from its config."""
+    # 'params' is a plain dict if we used dict(params) in __init__
+    params = config["params"]
+
+    # Rebuild the wrapped layer from its serialized form
+    layer_config = config["layer"]
+    wrapped_layer = tf.keras.utils.deserialize_keras_object(layer_config)
+
+    return cls(layer=wrapped_layer, params=params)
+
+@tf.keras.utils.register_keras_serializable(package="DeepConsensus")
 class EncoderStack(tf.keras.layers.Layer):
   """Transformer encoder stack.
 
   The encoder stack is made up of N identical layers. Each layer is composed
   of the sublayers:
     1. Self-attention layer
-    2. Feedforward network (which is 2 fully-connected layers)
+    2. Feedforward network (2 fully-connected layers)
   """
 
-  def __init__(self, params: ml_collections.ConfigDict):
-    super(EncoderStack, self).__init__()
-    self.params = params
+  def __init__(self, params: ml_collections.ConfigDict, **kwargs):
+    super().__init__(**kwargs)
+    # Convert ConfigDict -> plain dict so it's JSON-serializable
+    self.params = dict(params)
     self.layers = []
+    # We will build sub-layers in build() once we know input shapes
 
   def build(self, input_shape: Union[tf.TensorShape, Iterable[tf.TensorShape]]):
     """Builds the encoder stack."""
+    # Access the plain dict
     params = self.params
+
     for _ in range(params["num_hidden_layers"]):
       # Create sublayers for each layer.
       self_attention_layer = attention_layer.SelfAttention(
-          params["hidden_size"],
-          params["num_heads"],
-          params["attention_dropout"],
-          params["attn_win_size"],
+          hidden_size=params["hidden_size"],
+          num_heads=params["num_heads"],
+          attention_dropout=params["attention_dropout"],
+          attn_win_size=params["attn_win_size"],
       )
       feed_forward_network = ffn_layer.FeedForwardNetwork(
-          params["hidden_size"], params["filter_size"], params["relu_dropout"]
+          hidden_size=params["hidden_size"],
+          filter_size=params["filter_size"],
+          relu_dropout=params["relu_dropout"],
       )
 
+      # Wrap each sub-layer with PrePostProcessingWrapper
       self.layers.append([
           PrePostProcessingWrapper(self_attention_layer, params),
           PrePostProcessingWrapper(feed_forward_network, params),
@@ -131,12 +168,7 @@ class EncoderStack(tf.keras.layers.Layer):
     self.output_normalization = tf.keras.layers.LayerNormalization(
         epsilon=1e-6, dtype="float32"
     )
-    super(EncoderStack, self).build(input_shape)
-
-  def get_config(self) -> Dict[str, Any]:
-    return {
-        "params": self.params,
-    }
+    super().build(input_shape)
 
   def call(
       self,
@@ -148,29 +180,20 @@ class EncoderStack(tf.keras.layers.Layer):
     """Return the output of the encoder layer stacks.
 
     Args:
-      encoder_inputs: tensor with shape [batch_size, input_length, hidden_size]
-      attention_bias: bias for the encoder self-attention layer. [batch_size, 1,
-        1, input_length]
-      inputs_padding: tensor with shape [batch_size, input_length], inputs with
-        zero paddings.
-      training: boolean, whether in training mode or not.
+      encoder_inputs: tensor [batch_size, input_length, hidden_size]
+      attention_bias: bias for the encoder self-attention layer [batch_size, 1, 1, input_length]
+      inputs_padding: tensor [batch_size, input_length], inputs with zero paddings
+      training: bool, whether in training mode
 
     Returns:
-      Dictionary with the following (key:value) pairs:
-        "self_attention_layer_{n}": Attention layer output for every layer in
-        the encoder stack with shape [batch_size, input_length, hidden_size].
-        "attention_scores_{n}" : Attention map for every layer in the
-        encoder stack with shape [batch_size, num_heads, input_length,
-        input_length].
-        "ffn_layer_{n}": Feedforward network output for every layer in the
-        encoder stack with shape [batch_size, input_length, hidden_size].
-        "final_output": Final output of the entire encoder stack after
-        normalization with shape [batch_size, input_length, hidden_size]. Used
-        as input to the fully-connected layer which outputs logits.
+      Dictionary with:
+        "self_attention_layer_{n}": attention outputs per layer
+        "attention_scores_{n}": attention maps
+        "ffn_layer_{n}": FFN outputs per layer
+        "final_output": final normalized output of the encoder stack
     """
-    outputs_dict = dict()
+    outputs_dict = {}
     for n, layer in enumerate(self.layers):
-      # Run inputs through the sublayers.
       self_attention_layer = layer[0]
       feed_forward_network = layer[1]
 
@@ -180,19 +203,32 @@ class EncoderStack(tf.keras.layers.Layer):
               encoder_inputs, attention_bias, training=training
           )
           encoder_inputs = layer_outputs["main_output"]
-          # Add attention layer outputs and attention map scores to outputs.
           outputs_dict[f"self_attention_layer_{n}"] = encoder_inputs
-          outputs_dict[f"attention_scores_{n}"] = layer_outputs[
-              "attention_scores"
-          ]
+          outputs_dict[f"attention_scores_{n}"] = layer_outputs["attention_scores"]
+
         with tf.name_scope("ffn"):
-          layer_outputs = feed_forward_network(
-              encoder_inputs, training=training
-          )
+          layer_outputs = feed_forward_network(encoder_inputs, training=training)
           encoder_inputs = layer_outputs["main_output"]
-          # Add output of the feedforward network to outputs.
           outputs_dict[f"ffn_layer_{n}"] = encoder_inputs
 
-    # Add normalized final output of the entire encoder stack to outputs.
+    # Final normalized output
     outputs_dict["final_output"] = self.output_normalization(encoder_inputs)
     return outputs_dict
+
+  def get_config(self) -> Dict[str, Any]:
+    """Returns a JSON-serializable config."""
+    config = super().get_config()
+    # Include just the plain dict for params:
+    config.update({
+        "params": self.params,
+    })
+    return config
+
+  @classmethod
+  def from_config(cls, config: Dict[str, Any]):
+    """Creates an EncoderStack from its config."""
+    # Re-wrap params in ConfigDict if your code relies on it:
+    # params = ml_collections.ConfigDict(config["params"])
+    # or just keep them as a plain dict
+    params = config["params"]
+    return cls(params=params)

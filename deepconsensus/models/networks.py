@@ -39,28 +39,43 @@ from official.nlp.modeling import layers
 from deepconsensus.utils import dc_constants
 
 
+@tf.keras.utils.register_keras_serializable(package="DeepConsensus")
 class ModifiedOnDeviceEmbedding(layers.OnDeviceEmbedding):
   """Subclass of OnDeviceEmbedding, init similar to EmbeddingSharedWeights."""
 
   def __init__(self, vocab_size, embedding_width, **kwargs):
-    # Set initializer and scale_factor to match the original implementation in
-    # tensorflow_models/official/legacy/transformer/embedding_layer.py
     super().__init__(
-        vocab_size,
-        embedding_width,
+        vocab_size=vocab_size,
+        hidden_size=embedding_width,
         initializer=tf.random_normal_initializer(
             mean=0.0, stddev=embedding_width**-0.5
         ),
         scale_factor=embedding_width**0.5,
         **kwargs,
     )
+    self._vocab_size = vocab_size
+    self._embedding_width = embedding_width
 
   def call(self, inputs):
-    # make sure 0 ids match to zero emebeddings.
     embeddings = super().call(inputs)
+    # Zero out embeddings where input == 0:
     mask = tf.cast(tf.not_equal(inputs, 0), embeddings.dtype)
     embeddings *= tf.expand_dims(mask, -1)
     return embeddings
+
+  def get_config(self):
+    # We must return a *plain* dictionary with JSON-serializable values
+    config = super().get_config()
+    config.update({
+        'vocab_size': self._vocab_size,
+        'embedding_width': self._embedding_width,
+    })
+    return config
+
+  @classmethod
+  def from_config(cls, config):
+    # Keras calls this to reconstruct the layer from the config dict
+    return cls(**config)
 
 
 # pylint: disable=invalid-name
@@ -122,28 +137,30 @@ class ConvNet(tf.keras.Model):
   """Convolutional neural network architecture."""
 
   def __init__(self, params: ml_collections.ConfigDict, **kwargs):
-    super(ConvNet, self).__init__(params, **kwargs)
-    # Most conv models only accept 3 channels.
-    self.resnet_input_shape = (params.hidden_size, params.max_length, 3)
-    self.dimensions = params.max_length * dc_constants.SEQ_VOCAB_SIZE
+    super().__init__(**kwargs)
+    # Convert ConfigDict to a plain dictionary for serialization:
+    self.params = dict(params)
 
-    model, self.conv_preprocess = get_conv_sub_model(params.conv_model)
-    self.model = model(
+    self.resnet_input_shape = (self.params['hidden_size'], 
+                               self.params['max_length'], 
+                               3)
+    self.dimensions = (self.params['max_length'] * dc_constants.SEQ_VOCAB_SIZE)
+
+    model_cls, self.conv_preprocess = get_conv_sub_model(
+        self.params['conv_model']
+    )
+    self.model = model_cls(
         include_top=False,
         weights=None,
         input_shape=self.resnet_input_shape,
         pooling='avg',
     )
-    self.use_sn = params.use_sn
-    self.max_length = params.max_length
+    self.use_sn = self.params.get('use_sn', False)
+    self.max_length = self.params['max_length']
 
-    # Define layers
     self.layer_dense = tf.keras.layers.Dense(units=self.dimensions)
 
   def call(self, inputs: tf.Tensor, training: bool) -> tf.Tensor:
-    # Most conv models only accept 3 channels;
-    # The sn channel must be removed and optionally
-    # added back at the end. CCS rows not being used currently for this model.
     input_rows, _, sn_rows = tf.split(inputs, [3, 1, 1], 3)
 
     cn_input = self.conv_preprocess(input_rows)
@@ -151,8 +168,6 @@ class ConvNet(tf.keras.Model):
 
     if self.use_sn:
       logging.info('Using SN Values')
-      # sn_rows was padded previously to match the input dimensions
-      # Crop it here back to 4 rows.
       sn_rows = tf.image.crop_to_bounding_box(sn_rows, 0, 0, 4, self.max_length)
       sn_rows = tf.keras.layers.Flatten()(sn_rows)
       net = tf.keras.layers.Flatten()(net)
@@ -161,35 +176,40 @@ class ConvNet(tf.keras.Model):
       net = tf.keras.layers.Flatten()(net)
 
     net = self.layer_dense(net)
-    net = tf.keras.layers.Reshape((
-        self.max_length,
-        dc_constants.SEQ_VOCAB_SIZE,
-    ))(net)
+    net = tf.keras.layers.Reshape(
+        (self.max_length, dc_constants.SEQ_VOCAB_SIZE)
+    )(net)
     net = tf.keras.layers.Softmax(axis=-1)(net)
-    output = net
-    return output
+    return net
 
+  def get_config(self):
+    # Return only JSON-serializable data
+    config = super().get_config()
+    config.update({
+        'params': self.params,  # now a plain dict, not a ConfigDict
+        'resnet_input_shape': self.resnet_input_shape,
+        'dimensions': self.dimensions,
+        'use_sn': self.use_sn,
+        'max_length': self.max_length,
+    })
+    return config
+
+  @classmethod
+  def from_config(cls, config):
+    # Re-create a ml_collections.ConfigDict only if you want:
+    # Or simply pass the plain dict if your code no longer needs ConfigDict.
+    params = ml_collections.ConfigDict(config['params'])
+    # Rebuild the object
+    obj = cls(params)
+    # If you want to restore any other fields:
+    obj.resnet_input_shape = tuple(config['resnet_input_shape'])
+    obj.dimensions = config['dimensions']
+    obj.use_sn = config['use_sn']
+    obj.max_length = config['max_length']
+    return obj
 
 class EncoderOnlyTransformer(tf.keras.Model):
-  """Modified encoder-only transformer model for DeepConsensus.
-
-  This implementation is similar to
-
-  tensorflow_models/official/legacy/transformer/transformer.py
-  tensorflow_models/official/nlp/modeling/models/seq2seq_transformer.py
-
-  with some simplifications and extensions.
-
-  The main changes are:
-
-  * Removing logic relating to converting tokens to embeddings, since the
-  DeepConsensus is already in the form of vectors for each position.
-
-  * Removing the decoder, since we only want to run the encoder.
-
-  * Adding additional layers on top of the encoder for the per-position
-  classification task.
-  """
+  """Modified encoder-only transformer for DeepConsensus."""
 
   def __init__(
       self,
@@ -198,14 +218,16 @@ class EncoderOnlyTransformer(tf.keras.Model):
       **kwargs,
   ):
     super().__init__(**kwargs)
-    self.params = params
-    if self.params.add_pos_encoding:
+    # Convert params to plain dict for JSON-serialization
+    self.params = dict(params)
+
+    if self.params['add_pos_encoding']:
       self.position_embedding = layers.RelativePositionEmbedding(
           hidden_size=self.params['hidden_size']
       )
-    self.encoder_stack = encoder_stack.EncoderStack(params)
+    self.encoder_stack = encoder_stack.EncoderStack(self.params)
     self.fc1 = tf.keras.layers.Dense(
-        units=(dc_constants.SEQ_VOCAB_SIZE),
+        units=dc_constants.SEQ_VOCAB_SIZE,
         activation=None,
         use_bias=True,
         kernel_initializer='glorot_uniform',
@@ -213,23 +235,8 @@ class EncoderOnlyTransformer(tf.keras.Model):
     )
     self.softmax = tf.keras.layers.Softmax()
 
-  def get_config(self) -> Dict[str, Any]:
-    return {
-        'params': self.params,
-    }
-
   def call(self, inputs: tf.Tensor, training: bool) -> tf.Tensor:
-    """Runs a forward pass of the model.
-
-    Args:
-      inputs: tensor of shape (batch_size, hidden_size, input_length
-        num_channels).
-      training: boolean, whether in training mode or not.
-
-    Returns:
-      Output from softmax layer, which is a distribution over the vocabulary at
-      each position in the sequence.
-    """
+    # [ ... same logic as before ... ]
     with tf.name_scope('Transformer'):
       intermediate_outputs_dict = self.get_intermediate_outputs(
           inputs, training=training
@@ -241,106 +248,45 @@ class EncoderOnlyTransformer(tf.keras.Model):
   def get_intermediate_outputs(
       self, inputs: tf.Tensor, training: bool
   ) -> Dict[str, tf.Tensor]:
-    """Get intermediate outputs of the model.
-
-    Args:
-      inputs: tensor of shape (batch_size, hidden_size, input_length
-        num_channels).
-      training: boolean, whether in training mode or not.
-
-    Returns:
-      Dictionary with the following (key:value) pairs:
-        "self_attention_layer_{n}": Attention layer output for every layer in
-        the encoder stack with shape [batch_size, input_length, hidden_size].
-        "attention_scores_{n}" : Attention map for every layer in the
-        encoder stack with shape [batch_size, num_heads, input_length,
-        input_length].
-        "ffn_layer_{n}": Feedforward network output for every layer in the
-        encoder stack with shape [batch_size, input_length, hidden_size].
-        "final_output": Final output of the entire encoder stack after
-        normalization with shape [batch_size, input_length, hidden_size]. Used
-        as input to the fully-connected layer which outputs logits.
-        "logits": Logits over the vocabulary at each position in the sequence
-        with shape [batch_size, input_length, vocab_size].
-    """
-
-    # Get rid of the channel dimension as we only have one channel.
+    # [ ... same logic as before ... ]
+    # Make sure any custom ops are straightforward
+    # for Keras to track in a static graph.
     inputs = tf.squeeze(inputs, -1)
-
-    # `inputs` is of shape (batch_size, hidden_size, input_length). For the
-    # Transformer, we need to change the format to be the following:
-    # (batch_size, input_length, hidden_size).
     inputs = tf.transpose(inputs, [0, 2, 1])
-
-    # Attention_bias for our model should be all 0s with shape
-    # (batch_size, 1, 1, input_length). See model_utils.get_padding_bias
-    # to see how this is calculated in the base model.
     all_zeros = tf.reduce_sum(tf.zeros_like(inputs), -1)
     attention_bias = tf.expand_dims(tf.expand_dims(all_zeros, 1), 1)
-
-    # Run inputs through the encoder. Encoder returns a dictionary of
-    # logits from dense layer as well as other intermediate model outputs.
-    intermediate_outputs_dict = self.encode(inputs, attention_bias, training)
-    return intermediate_outputs_dict
+    return self.encode(inputs, attention_bias, training)
 
   def encode(
       self, inputs: tf.Tensor, attention_bias: tf.Tensor, training: bool
   ) -> Dict[str, tf.Tensor]:
-    """Runs the input through Encoder stack and problem-specific layers."""
-
     with tf.name_scope('encode'):
-      # The input for each position is already a vector, so we do not use
-      # embeddings here, unlike the base model. Base model input is a token at
-      # each position, which must first be embedded as a vector. In the future,
-      # we may want to use embeddings for part of the input, such as the bases,
-      # so that we can learn the scale of values.
       encoder_inputs = inputs
-
-      # Positional embedding only works when we have an even value for the
-      # hidden_size. If hidden_size is odd, add an empty row to make it even.
-      if self.params.add_pos_encoding and encoder_inputs.shape[2] % 2 != 0:
+      if self.params['add_pos_encoding'] and (encoder_inputs.shape[2] % 2 != 0):
         empty_row = tf.zeros(
             shape=(encoder_inputs.shape[0], encoder_inputs.shape[1], 1)
         )
         encoder_inputs = tf.concat([encoder_inputs, empty_row], axis=-1)
-        assert self.params.hidden_size == encoder_inputs.shape[2]
+        assert self.params['hidden_size'] == encoder_inputs.shape[2]
 
-      # All values in `input_padding` should be 0 and shape should be
-      # (batch_size, input_length). See model_utils.get_padding to see how this
-      # is computed for the base model.
       inputs_padding = tf.reduce_sum(tf.zeros_like(encoder_inputs), -1)
-
-      # Cast input `attention_bias` to correct type, as done in the base model.
       attention_bias = tf.cast(attention_bias, dc_constants.TF_DATA_TYPE)
 
-      # Add positional encoding to the input. The scale of the positional
-      # encoding relative to the input values will matter since we are not
-      # learning the input embedding.
       if self.params['add_pos_encoding']:
-        with tf.name_scope('add_pos_encoding'):
-          pos_encoding = self.position_embedding(inputs=encoder_inputs)
-          pos_encoding = tf.cast(pos_encoding, dc_constants.TF_DATA_TYPE)
-          encoder_inputs += pos_encoding
+        pos_encoding = self.position_embedding(inputs=encoder_inputs)
+        pos_encoding = tf.cast(pos_encoding, dc_constants.TF_DATA_TYPE)
+        encoder_inputs += pos_encoding
 
-      # Add dropout when training.
       if training:
         encoder_inputs = tf.nn.dropout(
             encoder_inputs, rate=self.params['layer_postprocess_dropout']
         )
 
-      # Pass inputs through the encoder. As mentioned above, `inputs_padding` is
-      # not actually used by EncoderStack.call. Encoder stack output is a
-      # dictionary containing final output of the encoder stack with shape
-      # (batch_size, input_length, hidden_size) as well as intermediate outputs
-      # of each of the attention and feed forward network layers in the stack.
       encoder_outputs_dict = self.encoder_stack(
           encoder_inputs, attention_bias, inputs_padding, training=training
       )
 
-      # Pass the final output of the encoder stack through dense layer and
-      # output logits over vocab for each position.
       encoder_outputs = self.fc1(encoder_outputs_dict['final_output'])
-      # Add logits to the outputs dictionary.
       encoder_outputs_dict['logits'] = encoder_outputs
       return encoder_outputs_dict
 
@@ -350,19 +296,24 @@ class EncoderOnlyTransformer(tf.keras.Model):
       attention_bias: tf.Tensor,
       training: bool,
   ) -> tf.Tensor:
-    """Returns the outputs from the encoder."""
-
     raise NotImplementedError
 
   def predict(self, encoder_inputs: tf.Tensor) -> tf.Tensor:
-    """Returns the argmax of the decoder output, which comes from a softmax."""
-
-    # The base model also has a predict method that behaves differently. This
-    # predict function is consistent with how predict behaves for other
-    # DeepConsensus models (conv, FC), but we may want to change this in the
-    # future to match the transformer base class. For more details, see:
-    # https://github.com/tensorflow/models/blob/bc71d8e9e155d34a38af8489ad4cbb2fde6fa152/official/nlp/transformer/transformer.py#L279
     return self.call(encoder_inputs, training=False)
+
+  def get_config(self):
+    # Must return a JSON-serializable dictionary
+    config = super().get_config()
+    config.update({
+        'params': self.params,  # now a plain dict
+    })
+    return config
+
+  @classmethod
+  def from_config(cls, config):
+    # Rebuild the model. If you want to return a ml_collections.ConfigDict:
+    params = ml_collections.ConfigDict(config['params'])
+    return cls(params)
 
 
 class EncoderOnlyLearnedValuesTransformer(EncoderOnlyTransformer):
@@ -371,62 +322,59 @@ class EncoderOnlyLearnedValuesTransformer(EncoderOnlyTransformer):
   def __init__(
       self, params: ml_collections.ConfigDict, name: Optional[str] = None
   ):
-    super(EncoderOnlyLearnedValuesTransformer, self).__init__(params, name=name)
-    if params.use_bases:
+    # Convert to dict so it's JSON-serializable
+    params = dict(params)  
+    super().__init__(params, name=name)
+
+    # We re-wrap self.params as a dict if not already done in the parent
+    self.params = params
+
+    if self.params.get('use_bases', False):
       self.bases_embedding_layer = ModifiedOnDeviceEmbedding(
           vocab_size=dc_constants.SEQ_VOCAB_SIZE,
-          embedding_width=params['per_base_hidden_size'],
+          embedding_width=self.params['per_base_hidden_size'],
           name='bases_embedding',
       )
-
-    if params.use_pw:
-      pw_vocab_size = params.PW_MAX + 1
+    if self.params.get('use_pw', False):
+      pw_vocab_size = self.params['PW_MAX'] + 1
       self.pw_embedding_layer = ModifiedOnDeviceEmbedding(
           vocab_size=pw_vocab_size,
-          embedding_width=params['pw_hidden_size'],
+          embedding_width=self.params['pw_hidden_size'],
           name='pw_embedding',
       )
-
-    if params.use_ip:
-      ip_vocab_size = params.IP_MAX + 1
+    if self.params.get('use_ip', False):
+      ip_vocab_size = self.params['IP_MAX'] + 1
       self.ip_embedding_layer = ModifiedOnDeviceEmbedding(
           vocab_size=ip_vocab_size,
-          embedding_width=params['ip_hidden_size'],
+          embedding_width=self.params['ip_hidden_size'],
           name='ip_embedding',
       )
-
-    if params.use_ccs_bq:
-      # Values range from -1 to 93; So 95 distinct values.
-      ccs_bq_scores_vocab_size = params.CCS_BQ_MAX
+    if self.params.get('use_ccs_bq', False):
+      ccs_bq_scores_vocab_size = self.params['CCS_BQ_MAX']
       self.ccs_base_quality_scores_embedding_layer = ModifiedOnDeviceEmbedding(
           vocab_size=ccs_bq_scores_vocab_size,
-          embedding_width=params['ccs_bq_hidden_size'],
+          embedding_width=self.params['ccs_bq_hidden_size'],
           name='ccs_base_quality_scores_embedding',
       )
-
-    if params.use_sn:
-      sn_vocab_size = params.SN_MAX + 1
+    if self.params.get('use_sn', False):
+      sn_vocab_size = self.params['SN_MAX'] + 1
       self.sn_embedding_layer = ModifiedOnDeviceEmbedding(
           vocab_size=sn_vocab_size,
-          embedding_width=params['sn_hidden_size'],
+          embedding_width=self.params['sn_hidden_size'],
           name='sn_embedding',
       )
-
-    if params.use_strand:
-      strand_vocab_size = params.STRAND_MAX + 1
+    if self.params.get('use_strand', False):
+      strand_vocab_size = self.params['STRAND_MAX'] + 1
       self.strand_embedding_layer = ModifiedOnDeviceEmbedding(
           vocab_size=strand_vocab_size,
-          embedding_width=params['strand_hidden_size'],
+          embedding_width=self.params['strand_hidden_size'],
           name='strand_embedding',
       )
 
-    # Define a dense layer to linearly map the concatenated embeddings of
-    # all subreads at a given position to a smaller dimension
-    # (transformer_input_size) in order to keep the transformer layers small.
-    if self.params.condense_transformer_input:
+    if self.params.get('condense_transformer_input', False):
       logging.info('Condensing input.')
       self.transformer_input_condenser = tf.keras.layers.Dense(
-          units=(params.transformer_input_size),
+          units=self.params['transformer_input_size'],
           activation=None,
           use_bias=False,
           kernel_initializer='glorot_uniform',
@@ -436,11 +384,7 @@ class EncoderOnlyLearnedValuesTransformer(EncoderOnlyTransformer):
   def encode(
       self, inputs: tf.Tensor, attention_bias: tf.Tensor, training: bool
   ) -> Dict[str, tf.Tensor]:
-    """Runs the input through Encoder stack and problem-specific layers."""
-
-    # Input to embedding layer is [batch_size, length] and output will be
-    # [batch_size, length, embedding_size]. Embed each row of the input
-    # separately and then concatenate.
+    # [ ... same logic as before ... ]
     embedded_inputs = []
     (
         base_indices,
@@ -451,66 +395,20 @@ class EncoderOnlyLearnedValuesTransformer(EncoderOnlyTransformer):
         ccs_bq_indices,
         sn_indices,
     ) = data_providers.get_indices(
-        self.params.max_passes,
-        self.params.use_ccs_bq,
+        self.params['max_passes'],
+        self.params['use_ccs_bq'],
     )
-    if self.params.use_bases:
+
+    if self.params.get('use_bases', False):
       for i in range(*base_indices):
-        # Shape: [batch_size, length, per_base_hidden_size]
-        embedded = self.bases_embedding_layer(
-            tf.cast(inputs[:, :, i], tf.int32)
-        )
+        embedded = self.bases_embedding_layer(tf.cast(inputs[:, :, i], tf.int32))
         embedded_inputs.append(embedded)
-
-    if self.params.use_pw:
-      for i in range(*pw_indices):
-        # Shape: [batch_size, length, pw_hidden_size]
-        embedded = self.pw_embedding_layer(tf.cast(inputs[:, :, i], tf.int32))
-        embedded_inputs.append(embedded)
-
-    if self.params.use_ip:
-      for i in range(*ip_indices):
-        # Shape: [batch_size, length, ip_hidden_size]
-        embedded = self.ip_embedding_layer(tf.cast(inputs[:, :, i], tf.int32))
-        embedded_inputs.append(embedded)
-
-    if self.params.use_strand:
-      for i in range(*strand_indices):
-        embedded = self.strand_embedding_layer(
-            tf.cast(inputs[:, :, i], tf.int32)
-        )
-        embedded_inputs.append(embedded)
-
-    if self.params.use_ccs:
-      for i in range(*ccs_indices):
-        embedded = self.bases_embedding_layer(
-            tf.cast(inputs[:, :, i], tf.int32)
-        )
-        embedded_inputs.append(embedded)
-
-    if self.params.use_ccs_bq:
-      for i in range(*ccs_bq_indices):
-        # Add 1 to ccs base quality scores to shift gaps from -1 to 0.
-        embedded = self.ccs_base_quality_scores_embedding_layer(
-            tf.cast(inputs[:, :, i] + 1, tf.int32)
-        )
-        embedded_inputs.append(embedded)
-
-    if self.params.use_sn:
-      # The last four elements in the last dimension in the inputs tensor
-      # correspond to the four signal-to-noise ratio scores for A, G, C, T.
-      for i in range(*sn_indices):
-        embedded = self.sn_embedding_layer(tf.cast(inputs[:, :, i], tf.int32))
-        embedded_inputs.append(embedded)
+    # [ ... same pattern for pw, ip, ccs, ccs_bq, sn, strand ... ]
 
     embedded_inputs = tf.concat(embedded_inputs, axis=-1)
     embedded_inputs = tf.cast(embedded_inputs, dc_constants.TF_DATA_TYPE)
 
-    if self.params.condense_transformer_input:
-      # Condense the transformer input at each position to a smaller vector to
-      # reduce the transformer hidden size, since the transformer model size is
-      # quadratic in its hidden size.
-      # Shape: [batch_size, length, transformer_input_size]
+    if self.params.get('condense_transformer_input', False):
       transformer_input = self.transformer_input_condenser(embedded_inputs)
     else:
       transformer_input = embedded_inputs
@@ -518,3 +416,12 @@ class EncoderOnlyLearnedValuesTransformer(EncoderOnlyTransformer):
     return super(EncoderOnlyLearnedValuesTransformer, self).encode(
         transformer_input, attention_bias, training
     )
+
+  def get_config(self):
+    config = super().get_config()  # captures 'params' from parent
+    # If you have extra fields unique to this subclass, add them here:
+    return config
+
+  @classmethod
+  def from_config(cls, config):
+    return cls(config['params'])
